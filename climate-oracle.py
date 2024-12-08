@@ -30,6 +30,10 @@ import os
 import time
 import logging
 from logging import Logger
+from typing import List, Dict, Tuple
+import requests
+from requests.exceptions import ConnectionError
+
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings,ChatOpenAI, OpenAI
 from langchain_ollama.llms import OllamaLLM
@@ -42,9 +46,6 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_community.callbacks import get_openai_callback
 from langchain_core.runnables import Runnable
 from langchain_core.language_models import LLM
-from typing import List, Dict, Tuple
-import requests
-from requests.exceptions import ConnectionError
 
 PROGRAM = __file__.split("/")[-1]
 VERSION = "0.5"
@@ -95,7 +96,8 @@ def is_ollama_running(logger: Logger) -> bool:
     try:
         response = requests.get(f'{OLLAMA_URL}/api/tags')
         return response.status_code == 200
-    except ConnectionError:
+    except ConnectionError as e:
+        logger.error(f"Ollama is not running: {e}")
         return False
 
 def getModel(model_provider: str, logger: Logger) -> LLM:
@@ -125,7 +127,7 @@ def getModel(model_provider: str, logger: Logger) -> LLM:
         # Default to Ollama if no model name passed in at CLI - check if it is running locally first
         logger.info("Checking if Ollama is running...")
         if not is_ollama_running(logger):
-            raise RuntimeError(f"Ollama is not found at {OLLAMA_URL}. Please start Ollama first.")
+            raise RuntimeError(f"Ollama is not found at {OLLAMA_URL}. It needs to be running first.")
         # See: https://python.langchain.com/docs/integrations/providers/ollama/
         # pip install -U langchain-ollama
         model_name = 'llama3.2'
@@ -184,9 +186,25 @@ def getAnswer(model_name: str, qa_chain: Runnable, question: str, logger: Logger
     full_prompt = system_prompt.format(context=context_text, question=question)
     logger.info(f"Full prompt with RAG content:\n{full_prompt}")
     # Add RAG references to return object
+    calculateReferences(answer, r, logger)
+
+    # 3. Get price of running the query
+    # Prices obtained from looking at pricing pages for each model per million tokens in USD:
+    # https://www.anthropic.com/pricing#anthropic-api
+    # https://platform.openai.com/pricing
+    # Derive counts using full context prompt
+    r['prompt_tokens'] = len(full_prompt.split())
+    r['completion_tokens'] = len(answer_text.split())
+    r['total_tokens'] = r['prompt_tokens'] + r['completion_tokens']
+    calculateCosts(model_name, r, logger)
+    return r
+
+def calculateReferences(answer: Dict, r: Dict, logger: Logger) -> None:
+    ''' Calculate references. '''
+    logger.info(f"::calculateReferences()")
     r['references'] = []
     r['context'] = []
-    for i,doc in enumerate(context):
+    for i,doc in enumerate(answer.get('context')):
         ref = doc.to_json()
         source = f"source: {ref.get('kwargs').get('metadata').get('source')}"
         page = f"page: {ref.get('kwargs').get('metadata').get('page')}"
@@ -195,26 +213,18 @@ def getAnswer(model_name: str, qa_chain: Runnable, question: str, logger: Logger
         contents = f'chunk length: {chunklen}, snippet: "{chunk}"'
         r['references'].append(f"{source}, {page}")
         r['context'].append(contents)
-    # Derive counts using full context prompt
-    r['prompt_tokens'] = len(full_prompt.split())
-    r['completion_tokens'] = len(answer_text.split())
-    r['total_tokens'] = r['prompt_tokens'] + r['completion_tokens']
 
-    # 3. Get price of running the query
-    # Prices obtained from looking at pricing pages for each model per million tokens in USD:
-    # https://www.anthropic.com/pricing#anthropic-api
-    # https://platform.openai.com/pricing
-    mapping = {'llama3.2': [0.0,0.0],
+def calculateCosts(model_name: str, r: Dict, logger: Logger) -> None:
+    ''' Calculate costs. '''
+    logger.info(f"::calculateCosts({model_name})")
+    mapping = {'llama3.2': [0.0, 0.0],
                'gpt-3.5-turbo-instruct': [1.5, 2.00],
                'gpt-4o': [2.5, 10.00],
                'claude-3-5-sonnet-latest': [3.0, 15.00]}
     pc, cc = mapping[model_name] or [0.0, 0.0]
-    logger.info(f"Calculating [prompt,completion] costs for model='{model_name}' which maps to {pc,cc}")
-    print(f"Calculating [prompt,completion] costs for model='{model_name}' which maps to {pc,cc}")
-    prompt_cost = r['prompt_tokens'] * pc/1000000
-    completion_cost = r['completion_tokens'] * cc/1000000
+    prompt_cost = r.get('prompt_tokens') * pc/1000000
+    completion_cost = r.get('completion_tokens') * cc/1000000
     r['cost'] = prompt_cost + completion_cost
-    return r
 
 def formatCosts(answer: Dict, logger: Logger) -> str:
     ''' Format costs. '''
@@ -270,7 +280,7 @@ def main(arguments: Dict):
         try:
             model_name, climate_qa_chain = generateChain(pdfs, model_provider, logger, force)
         except Exception as e:
-            print(f"Error generating create_retrieval_chain: {e}")
+            print(f"Error generating retrieval chain: {e}\nPlease ensure dependencies are installed and started.")
             return
         t1 = time.time()
         print(f"successfully loaded RAG in {round((t1-t0),2)} seconds and will use '{model_name}' LLM")
@@ -291,8 +301,8 @@ def main(arguments: Dict):
                 if references and answer.get('references'):
                     s += formatReferences(answer, logger)
                 print(s)
-            except:                
-                print("Interrupt.  Exiting the program. Goodbye!")
+            except Exception as e:
+                print(f"{e}.  Exiting the program. Goodbye!")
                 break
 
 if __name__ == "__main__":
