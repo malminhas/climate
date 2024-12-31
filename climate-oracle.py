@@ -24,7 +24,8 @@
 # 26.11.24    v0.2    Added Anthropic and Ollama LLMs plus CLI support
 # 29.11.24    v0.3    First drop into climate repository
 # 07.12.24    v0.4    Added cost output and force to regenerate vectorstore
-# 08.12.24    v0.5    Added tokencost for pricing, referencesswitched to Ollama default
+# 08.12.24    v0.5    Added tokencost for pricing, references switched to Ollama default
+# 30.12.24    v0.6    Added groq support
 
 import os
 import time
@@ -35,9 +36,10 @@ import requests
 from requests.exceptions import ConnectionError
 
 from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings,ChatOpenAI, OpenAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI, OpenAI
 from langchain_ollama.llms import OllamaLLM
 from langchain_anthropic import ChatAnthropic
+from langchain_groq import ChatGroq
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -48,11 +50,11 @@ from langchain_core.runnables import Runnable
 from langchain_core.language_models import LLM
 
 PROGRAM = __file__.split("/")[-1]
-VERSION = "0.5"
-DATE = "08.12.24"
+VERSION = "0.6"
+DATE = "30.12.24"
 AUTHOR = "<mal@malm.co.uk>"
 
-VALID_MODELS = ['ollama', 'gpt-3.5', 'gpt-4', 'claude']
+VALID_MODELS = ['ollama', 'gpt-3.5', 'gpt-4', 'claude', 'groq']
 IPCC_AR6_PDF = "https://www.ipcc.ch/report/ar6/syr/downloads/report/IPCC_AR6_SYR_LongerReport.pdf"
 OLLAMA_URL = "http://localhost:11434"
 
@@ -122,7 +124,13 @@ def getModel(model_provider: str, logger: Logger) -> LLM:
         #llm = ChatAnthropic(model=name, temperature=0)
         model_name = 'claude-3-5-sonnet-latest'
         print(f"Using Anthropic model='{model_name}'")
-        llm = ChatAnthropic(model=model_name, temperature=0)
+        llm = ChatAnthropic(model_name=model_name, temperature=0)
+    elif model_provider in ['groq']:
+        # See: https://python.langchain.com/docs/integrations/providers/groq/
+        # pip install -U langchain-groq
+        model_name = 'mixtral-8x7b-32768' # limited to 5000 characters
+        print(f"Using Groq model='{model_name}'")
+        llm = ChatGroq(model_name=model_name, temperature=0)
     elif model_provider in ['ollama']:
         # Default to Ollama if no model name passed in at CLI - check if it is running locally first
         logger.info("Checking if Ollama is running...")
@@ -159,10 +167,14 @@ def generateChain(pdfs: List, model_provider: str, logger: Logger, force: bool =
         
     # Original recipe had number of chunks as len(pdfs) but this is too few for a single document
     #retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": len(pdfs)})
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 30})
     model_name, llm = getModel(model_provider, logger)
-        
-    # Question-answering against an index using create_retrieval_chain:    
+    if model_provider == 'groq':
+        print(f"For groq we are setting k to 5")
+        retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+    else:
+        print(f"For {model_provider} we are setting k to 30")
+        retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 30})
+    # Question-answering against an index using create_retrieval_chain:
     prompt = PromptTemplate(template=system_prompt, input_variables=["question", "context"])
     
     document_chain = create_stuff_documents_chain(llm, prompt)
@@ -185,6 +197,7 @@ def getAnswer(model_name: str, qa_chain: Runnable, question: str, logger: Logger
     # Construct the full prompt including RAG content
     full_prompt = system_prompt.format(context=context_text, question=question)
     logger.info(f"Full prompt with RAG content:\n{full_prompt}")
+    
     # Add RAG references to return object
     calculateReferences(answer, r, logger)
 
@@ -197,6 +210,7 @@ def getAnswer(model_name: str, qa_chain: Runnable, question: str, logger: Logger
     r['completion_tokens'] = len(answer_text.split())
     r['total_tokens'] = r['prompt_tokens'] + r['completion_tokens']
     calculateCosts(model_name, r, logger)
+    
     return r
 
 def calculateReferences(answer: Dict, r: Dict, logger: Logger) -> None:
@@ -219,6 +233,7 @@ def calculateCosts(model_name: str, r: Dict, logger: Logger) -> None:
     logger.info(f"::calculateCosts({model_name})")
     mapping = {'llama3.2': [0.0, 0.0],
                'gpt-3.5-turbo-instruct': [1.5, 2.00],
+               'mixtral-8x7b-32768': [0.1, 0.1],
                'gpt-4o': [2.5, 10.00],
                'claude-3-5-sonnet-latest': [3.0, 15.00]}
     pc, cc = mapping[model_name] or [0.0, 0.0]
@@ -302,7 +317,7 @@ def main(arguments: Dict):
                     s += formatReferences(answer, logger)
                 print(s)
             except Exception as e:
-                print(f"{e}.  Exiting the program. Goodbye!")
+                print(f"Exception: {e}.  Exiting the program. Goodbye!")
                 break
 
 if __name__ == "__main__":
@@ -319,7 +334,7 @@ if __name__ == "__main__":
     -h, --help                          Show this screen.
     -v, --verbose                       Verbose mode.
     -V, --version                       Show version.
-    -m <model>, --model <model>         LLM. Default is ollama. Options: gpt-3.5, gpt-4, claude.
+    -m <model>, --model <model>         LLM. Default is ollama. Options: gpt-3.5, gpt-4, claude, groq.
     -c, --cost                          Return cost of call in dollars + tokens
     -r, --references                    Return RAG references
     -f, --force                         Force regeneration of vectorstore.
